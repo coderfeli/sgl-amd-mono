@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import inspect
 import os
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
 import msgspec
 import torch
-from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 
 from .config import GLM5_GLOBAL_HEADS, GLM5_GLOBAL_INTER, HIDDEN, KV_LORA, PE_DIM
 from .layout import INDEX_DIM, layout
@@ -113,6 +113,9 @@ class Glm53Step(msgspec.Struct, frozen=True):
 
 def compile_only(launch) -> None:
     """Build the launcher without dispatching its kernels."""
+    # AITER probes the GPU when imported; test/unit imports this module on CPU
+    from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled
+
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
     _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
@@ -133,6 +136,8 @@ class Glm53Runtime:
     is the step epoch (``advance_step``)."""
 
     def __init__(self, key: Glm53Build, rank: int, group, device: torch.device):
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
         from sgl_amd_mono.common import guard
         from sgl_amd_mono.common.peer import PeerBuffer
 
@@ -175,6 +180,7 @@ class Glm53Runtime:
             fault_after=key.fault_after,
             stop=key.stop,
         )
+        self.dispatch = partial(_run_compiled, self.launch)
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
         self.peer.bytes.zero_()
         self.scratch = torch.zeros(self.sc["_bytes"], dtype=torch.uint8, device=device)
@@ -262,8 +268,7 @@ class Glm53LayerOp:
             )
         x_out = rt.outs[self.layer % 2]
         p = lambda t: t.data_ptr()  # noqa: E731
-        _run_compiled(
-            rt.launch,
+        rt.dispatch(
             p(h),
             p(x_out),
             p(step.positions),

@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import inspect
 import os
+from functools import partial
 from pathlib import Path
 from typing import Optional, Union
 
 import msgspec
 import torch
-from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 
 from .config import HC_MULT, HIDDEN, KPOOL, VOCAB
 from .layout import DSA_TAB, ROW_WORDS, STEP_TAB
@@ -161,6 +161,9 @@ IDX_BT_GROUP = INDEX_BLOCK_POOLS * KPOOL // PAGE_TOKENS
 
 def compile_only(launch) -> None:
     """Build the launcher without dispatching its kernels."""
+    # AITER probes the GPU when imported; test/unit imports this module on CPU
+    from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled
+
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
     _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
@@ -181,6 +184,8 @@ class FlashRuntime:
     is the step epoch (``advance_step``)."""
 
     def __init__(self, key, rank: int, group, device: torch.device):
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
         from sgl_amd_mono.common import guard
         from sgl_amd_mono.common.peer import PeerBuffer
 
@@ -189,6 +194,7 @@ class FlashRuntime:
         ensure_writable_flydsl_cache()
         self.key, self.width, self.rank = key, key.rows, rank
         self.launch, self.sc, self.sy = build_flash_kernel(key)
+        self.dispatch = partial(_run_compiled, self.launch)
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
         self.peer.bytes.zero_()
         self.scratch = torch.zeros(self.sc["_bytes"], dtype=torch.uint8, device=device)
@@ -463,8 +469,7 @@ class FlashLayerOp:
                 *map(p, (w.w_r, w.bias, w.w_ug, w.s_ug, w.w_dn, w.s_dn)),
                 *map(p, (w.w_sh_ug, w.s_sh_ug, w.w_sh_dn, w.s_sh_dn)),
             ]
-        _run_compiled(
-            rt.launch,
+        rt.dispatch(
             p(x),
             p(residual),
             p(post),
@@ -512,8 +517,7 @@ class FlashHeadOp:
         _check("post", post, (S, HC_MULT, 1), torch.float32)
         _check("comb", comb, (S, HC_MULT, HC_MULT), torch.float32)
         p = lambda t: t.data_ptr()  # noqa: E731
-        _run_compiled(
-            rt.launch,
+        rt.dispatch(
             p(x),
             p(residual),
             p(post),
