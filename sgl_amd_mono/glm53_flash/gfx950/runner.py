@@ -15,6 +15,7 @@ from typing import Optional, Union
 
 import msgspec
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 
 from .config import HC_MULT, HIDDEN, KPOOL, VOCAB
 from .layout import DSA_TAB, ROW_WORDS, STEP_TAB
@@ -159,21 +160,9 @@ IDX_BT_GROUP = INDEX_BLOCK_POOLS * KPOOL // PAGE_TOKENS
 
 
 def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    from flydsl.utils.env import CompileEnvManager
-
+    """Build the launcher without dispatching its kernels."""
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
+    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def ensure_writable_flydsl_cache() -> None:
@@ -474,7 +463,8 @@ class FlashLayerOp:
                 *map(p, (w.w_r, w.bias, w.w_ug, w.s_ug, w.w_dn, w.s_dn)),
                 *map(p, (w.w_sh_ug, w.s_sh_ug, w.w_sh_dn, w.s_sh_dn)),
             ]
-        rt.launch(
+        _run_compiled(
+            rt.launch,
             p(x),
             p(residual),
             p(post),
@@ -496,7 +486,7 @@ class FlashLayerOp:
             p(rt.epoch),
             rt.rank,
             self.layer,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return x_out, res_out, post_out, comb_out
 
@@ -522,7 +512,8 @@ class FlashHeadOp:
         _check("post", post, (S, HC_MULT, 1), torch.float32)
         _check("comb", comb, (S, HC_MULT, HC_MULT), torch.float32)
         p = lambda t: t.data_ptr()  # noqa: E731
-        rt.launch(
+        _run_compiled(
+            rt.launch,
             p(x),
             p(residual),
             p(post),
@@ -545,6 +536,6 @@ class FlashHeadOp:
             p(rt.epoch),
             rt.rank,
             self.layer,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return rt.logits

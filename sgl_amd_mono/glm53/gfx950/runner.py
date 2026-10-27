@@ -16,6 +16,7 @@ from typing import Optional
 
 import msgspec
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 
 from .config import GLM5_GLOBAL_HEADS, GLM5_GLOBAL_INTER, HIDDEN, KV_LORA, PE_DIM
 from .layout import INDEX_DIM, layout
@@ -111,21 +112,9 @@ class Glm53Step(msgspec.Struct, frozen=True):
 
 
 def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    from flydsl.utils.env import CompileEnvManager
-
+    """Build the launcher without dispatching its kernels."""
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
+    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def ensure_writable_flydsl_cache() -> None:
@@ -273,7 +262,8 @@ class Glm53LayerOp:
             )
         x_out = rt.outs[self.layer % 2]
         p = lambda t: t.data_ptr()  # noqa: E731
-        rt.launch(
+        _run_compiled(
+            rt.launch,
             p(h),
             p(x_out),
             p(step.positions),
@@ -316,6 +306,6 @@ class Glm53LayerOp:
             rt.rank,
             self.layer,
             pt.stride(0),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return x_out
